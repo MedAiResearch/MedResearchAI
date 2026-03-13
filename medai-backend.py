@@ -77,8 +77,9 @@ def probe_models():
 
 
 try:
-    import opengradient as og
+    import opengradient as _og
     import ssl, urllib3
+    og = _og
     # OG TEE uses self-signed cert — disable verification
     ssl._create_default_https_context = ssl._create_unverified_context
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
