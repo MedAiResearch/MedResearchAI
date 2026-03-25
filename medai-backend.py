@@ -1,4 +1,10 @@
-import os, json, re, time, requests, threading
+import os
+import json
+import re
+import time
+import asyncio
+import threading
+import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -37,19 +43,19 @@ _loop_thread = None
 
 def _start_loop():
     global _loop
-    import asyncio
     _loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_loop)
     _loop.run_forever()
 
 def _run(coro):
-    import asyncio
+    """Запустить корутину в фоновом event loop и дождаться результата."""
     future = asyncio.run_coroutine_threadsafe(coro, _loop)
     return future.result(timeout=120)
 
 try:
     import opengradient as _og
-    import ssl, urllib3
+    import ssl
+    import urllib3
 
     og = _og
     ssl._create_default_https_context = ssl._create_unverified_context
@@ -58,7 +64,7 @@ try:
     # Запускаем фоновый event loop
     _loop_thread = threading.Thread(target=_start_loop, daemon=True)
     _loop_thread.start()
-    time.sleep(0.2)
+    time.sleep(0.2)  # ждём пока loop запустится
 
     private_key = os.environ["OG_PRIVATE_KEY"]
     llm_client = og.LLM(private_key=private_key)
@@ -74,12 +80,15 @@ try:
     print("OG connected")
 except Exception as e:
     print(f"Demo mode: {e}")
+    OG_OK = False
+    llm_client = None
+    og = None
 
 
 # ── Поиск рабочей модели ──────────────────────────────────────────────────────
 def probe_models():
     global WORKING_MODEL
-    if not OG_OK or llm_client is None:
+    if not OG_OK or llm_client is None or og is None:
         return
 
     print("Probing models...")
@@ -91,8 +100,8 @@ def probe_models():
             print(f"Testing {name}...")
             result = _run(llm_client.chat(
                 model=model_enum,
-                messages=[{"role": "user", "content": "Reply with the single word: OK"}],
-                max_tokens=10,
+                messages=[{"role": "user", "content": "Reply: OK"}],
+                max_tokens=5,
                 temperature=0.0,
             ))
             raw = extract_raw(result)
@@ -221,6 +230,8 @@ def extract_raw(result):
     comp = getattr(result, 'completion_output', None)
     if comp and str(comp).strip():
         return str(comp)
+    if hasattr(result, 'text'):
+        return result.text
     for attr in dir(result):
         if attr.startswith('_'):
             continue
@@ -262,16 +273,16 @@ def parse_json(raw):
     return {"error": "Parse failed", "raw": raw[:300]}
 
 
-def call_llm(prompt, retries=3):
+def call_llm(messages, retries=3):  # ИСПРАВЛЕНО: теперь принимает messages как в CV Analyzer
     global WORKING_MODEL
 
     if not OG_OK or llm_client is None:
-        return demo_stats(prompt)
+        return demo_stats(messages)
 
     if WORKING_MODEL is None:
         probe_models()
     if WORKING_MODEL is None:
-        return demo_stats(prompt)
+        return demo_stats(messages)
 
     last_error = "Unknown error"
     for attempt in range(retries):
@@ -279,10 +290,7 @@ def call_llm(prompt, retries=3):
             print(f"\nLLM attempt {attempt+1}/{retries} | model: {WORKING_MODEL}")
             result = _run(llm_client.chat(
                 model=WORKING_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
+                messages=messages,  # ИСПРАВЛЕНО: прямая передача messages
                 max_tokens=3000,
                 temperature=0.3,
             ))
@@ -314,11 +322,25 @@ def call_llm(prompt, retries=3):
             else:
                 time.sleep(2)
 
-    return demo_stats(prompt)
+    return demo_stats(messages)
 
 
-def demo_stats(prompt):
-    disease = str(prompt).strip().split("\n")[0].replace("Disease:", "").strip()[:80]
+def demo_stats(messages):
+    # ИСПРАВЛЕНО: извлекаем disease из сообщений
+    disease = "Unknown"
+    if messages and isinstance(messages, list):
+        for msg in messages:
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    # Пытаемся извлечь disease из prompt
+                    lines = content.split("\n")
+                    for line in lines:
+                        if "Disease:" in line:
+                            disease = line.replace("Disease:", "").strip()[:80]
+                            break
+                    break
+    
     return {
         "disease": disease or "Unknown",
         "summary": f"Could not retrieve statistics for '{disease}' - OpenGradient TEE unavailable.",
@@ -370,13 +392,19 @@ def search():
         for r in raw_results[:6]
     )
 
-    prompt = (
+    # ИСПРАВЛЕНО: создаем messages как в CV Analyzer
+    user_content = (
         f"Disease: {disease}\n\n"
         f"Web search snippets:\n{snippets_text}\n\n"
         f"Fill the JSON with statistics for {disease}. Use search data + your knowledge."
     )
+    
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_content}
+    ]
 
-    result = call_llm(prompt)
+    result = call_llm(messages)  # ИСПРАВЛЕНО: передаем messages
     result["search_count"] = len(raw_results)
     return jsonify(result)
 
@@ -384,5 +412,6 @@ def search():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"MedAI Statistics on :{port} | OG: {'live' if OG_OK else 'demo'}")
-    probe_models()
+    if OG_OK:
+        probe_models()
     app.run(host="0.0.0.0", port=port, debug=False)
